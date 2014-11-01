@@ -8,7 +8,16 @@ const char *malloc_conf =
 static arena_dalloc_junk_small_t *arena_dalloc_junk_small_orig;
 static arena_dalloc_junk_large_t *arena_dalloc_junk_large_orig;
 static huge_dalloc_junk_t *huge_dalloc_junk_orig;
-static void *most_recently_junked;
+static void *watch_for_junking;
+static bool saw_junking;
+
+static void
+watch_junking(void *p)
+{
+
+	watch_for_junking = p;
+	saw_junking = false;
+}
 
 static void
 arena_dalloc_junk_small_intercept(void *ptr, arena_bin_info_t *bin_info)
@@ -21,7 +30,8 @@ arena_dalloc_junk_small_intercept(void *ptr, arena_bin_info_t *bin_info)
 		    "Missing junk fill for byte %zu/%zu of deallocated region",
 		    i, bin_info->reg_size);
 	}
-	most_recently_junked = ptr;
+	if (ptr == watch_for_junking)
+		saw_junking = true;
 }
 
 static void
@@ -35,7 +45,8 @@ arena_dalloc_junk_large_intercept(void *ptr, size_t usize)
 		    "Missing junk fill for byte %zu/%zu of deallocated region",
 		    i, usize);
 	}
-	most_recently_junked = ptr;
+	if (ptr == watch_for_junking)
+		saw_junking = true;
 }
 
 static void
@@ -48,7 +59,8 @@ huge_dalloc_junk_intercept(void *ptr, size_t usize)
 	 * enough that it doesn't make sense to duplicate the decision logic in
 	 * test code, so don't actually check that the region is junk-filled.
 	 */
-	most_recently_junked = ptr;
+	if (ptr == watch_for_junking)
+		saw_junking = true;
 }
 
 static void
@@ -87,22 +99,19 @@ test_junk(size_t sz_min, size_t sz_max)
 		}
 
 		if (xallocx(s, sz+1, 0, 0) == sz) {
-			void *junked = (void *)s;
-
+			watch_junking(s);
 			s = (char *)rallocx(s, sz+1, 0);
 			assert_ptr_not_null((void *)s,
 			    "Unexpected rallocx() failure");
-			if (!config_mremap || sz+1 <= arena_maxclass) {
-				assert_ptr_eq(most_recently_junked, junked,
-				    "Expected region of size %zu to be "
-				    "junk-filled",
-				    sz);
-			}
+			assert_true(saw_junking,
+			    "Expected region of size %zu to be junk-filled",
+			    sz);
 		}
 	}
 
+	watch_junking(s);
 	dallocx(s, 0);
-	assert_ptr_eq(most_recently_junked, (void *)s,
+	assert_true(saw_junking,
 	    "Expected region of size %zu to be junk-filled", sz);
 
 	arena_dalloc_junk_small = arena_dalloc_junk_small_orig;
@@ -137,13 +146,25 @@ TEST_END
 arena_ralloc_junk_large_t *arena_ralloc_junk_large_orig;
 static void *most_recently_trimmed;
 
+static size_t
+shrink_size(size_t size)
+{
+	size_t shrink_size;
+
+	for (shrink_size = size - 1; nallocx(shrink_size, 0) == size;
+	    shrink_size--)
+		; /* Do nothing. */
+
+	return (shrink_size);
+}
+
 static void
 arena_ralloc_junk_large_intercept(void *ptr, size_t old_usize, size_t usize)
 {
 
 	arena_ralloc_junk_large_orig(ptr, old_usize, usize);
 	assert_zu_eq(old_usize, arena_maxclass, "Unexpected old_usize");
-	assert_zu_eq(usize, arena_maxclass-PAGE, "Unexpected usize");
+	assert_zu_eq(usize, shrink_size(arena_maxclass), "Unexpected usize");
 	most_recently_trimmed = ptr;
 }
 
@@ -157,7 +178,7 @@ TEST_BEGIN(test_junk_large_ralloc_shrink)
 	arena_ralloc_junk_large_orig = arena_ralloc_junk_large;
 	arena_ralloc_junk_large = arena_ralloc_junk_large_intercept;
 
-	p2 = rallocx(p1, arena_maxclass-PAGE, 0);
+	p2 = rallocx(p1, shrink_size(arena_maxclass), 0);
 	assert_ptr_eq(p1, p2, "Unexpected move during shrink");
 
 	arena_ralloc_junk_large = arena_ralloc_junk_large_orig;
