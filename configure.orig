@@ -4881,12 +4881,6 @@ case "${host}" in
 	$as_echo "#define JEMALLOC_PURGE_MADVISE_FREE  " >>confdefs.h
 
 	;;
-  *-*-bitrig*)
-	CFLAGS="$CFLAGS"
-	abi="elf"
-	$as_echo "#define JEMALLOC_PURGE_MADVISE_FREE  " >>confdefs.h
-
-	;;
   *-*-linux*)
 	CFLAGS="$CFLAGS"
 	CPPFLAGS="$CPPFLAGS -D_GNU_SOURCE"
