@@ -110,26 +110,22 @@ void	tcache_bin_flush_large(tcache_bin_t *tbin, size_t binind, unsigned rem,
     tcache_t *tcache);
 void	tcache_arena_associate(tcache_t *tcache, arena_t *arena);
 void	tcache_arena_dissociate(tcache_t *tcache);
-tcache_t *tcache_get_hard(tcache_t *tcache, bool create);
+tcache_t *tcache_get_hard(tsd_t *tsd);
 tcache_t *tcache_create(arena_t *arena);
-void	tcache_destroy(tcache_t *tcache);
-void	tcache_thread_cleanup(void *arg);
+void	tcache_cleanup(tsd_t *tsd);
+void	tcache_enabled_cleanup(tsd_t *tsd);
 void	tcache_stats_merge(tcache_t *tcache, arena_t *arena);
-bool	tcache_boot0(void);
-bool	tcache_boot1(void);
+bool	tcache_boot(void);
 
 #endif /* JEMALLOC_H_EXTERNS */
 /******************************************************************************/
 #ifdef JEMALLOC_H_INLINES
 
 #ifndef JEMALLOC_ENABLE_INLINE
-malloc_tsd_protos(JEMALLOC_ATTR(unused), tcache, tcache_t *)
-malloc_tsd_protos(JEMALLOC_ATTR(unused), tcache_enabled, tcache_enabled_t)
-
 void	tcache_event(tcache_t *tcache);
 void	tcache_flush(void);
 bool	tcache_enabled_get(void);
-tcache_t *tcache_get(bool create);
+tcache_t *tcache_get(tsd_t *tsd, bool create);
 void	tcache_enabled_set(bool enabled);
 void	*tcache_alloc_easy(tcache_bin_t *tbin);
 void	*tcache_alloc_small(tcache_t *tcache, size_t size, bool zero);
@@ -139,41 +135,30 @@ void	tcache_dalloc_large(tcache_t *tcache, void *ptr, size_t size);
 #endif
 
 #if (defined(JEMALLOC_ENABLE_INLINE) || defined(JEMALLOC_TCACHE_C_))
-/* Map of thread-specific caches. */
-malloc_tsd_externs(tcache, tcache_t *)
-malloc_tsd_funcs(JEMALLOC_ALWAYS_INLINE, tcache, tcache_t *, NULL,
-    tcache_thread_cleanup)
-/* Per thread flag that allows thread caches to be disabled. */
-malloc_tsd_externs(tcache_enabled, tcache_enabled_t)
-malloc_tsd_funcs(JEMALLOC_ALWAYS_INLINE, tcache_enabled, tcache_enabled_t,
-    tcache_enabled_default, malloc_tsd_no_cleanup)
-
 JEMALLOC_INLINE void
 tcache_flush(void)
 {
-	tcache_t *tcache;
+	tsd_t *tsd;
 
 	cassert(config_tcache);
 
-	tcache = *tcache_tsd_get();
-	if ((uintptr_t)tcache <= (uintptr_t)TCACHE_STATE_MAX)
-		return;
-	tcache_destroy(tcache);
-	tcache = NULL;
-	tcache_tsd_set(&tcache);
+	tsd = tsd_fetch();
+	tcache_cleanup(tsd);
 }
 
 JEMALLOC_INLINE bool
 tcache_enabled_get(void)
 {
+	tsd_t *tsd;
 	tcache_enabled_t tcache_enabled;
 
 	cassert(config_tcache);
 
-	tcache_enabled = *tcache_enabled_tsd_get();
+	tsd = tsd_fetch();
+	tcache_enabled = tsd_tcache_enabled_get(tsd);
 	if (tcache_enabled == tcache_enabled_default) {
 		tcache_enabled = (tcache_enabled_t)opt_tcache;
-		tcache_enabled_tsd_set(&tcache_enabled);
+		tsd_tcache_enabled_set(tsd, tcache_enabled);
 	}
 
 	return ((bool)tcache_enabled);
@@ -182,46 +167,34 @@ tcache_enabled_get(void)
 JEMALLOC_INLINE void
 tcache_enabled_set(bool enabled)
 {
+	tsd_t *tsd;
 	tcache_enabled_t tcache_enabled;
-	tcache_t *tcache;
 
 	cassert(config_tcache);
 
+	tsd = tsd_fetch();
+
 	tcache_enabled = (tcache_enabled_t)enabled;
-	tcache_enabled_tsd_set(&tcache_enabled);
-	tcache = *tcache_tsd_get();
-	if (enabled) {
-		if (tcache == TCACHE_STATE_DISABLED) {
-			tcache = NULL;
-			tcache_tsd_set(&tcache);
-		}
-	} else /* disabled */ {
-		if (tcache > TCACHE_STATE_MAX) {
-			tcache_destroy(tcache);
-			tcache = NULL;
-		}
-		if (tcache == NULL) {
-			tcache = TCACHE_STATE_DISABLED;
-			tcache_tsd_set(&tcache);
-		}
-	}
+	tsd_tcache_enabled_set(tsd, tcache_enabled);
+
+	if (!enabled)
+		tcache_cleanup(tsd);
 }
 
 JEMALLOC_ALWAYS_INLINE tcache_t *
-tcache_get(bool create)
+tcache_get(tsd_t *tsd, bool create)
 {
 	tcache_t *tcache;
 
-	if (config_tcache == false)
-		return (NULL);
-	if (config_lazy_lock && isthreaded == false)
+	if (!config_tcache)
 		return (NULL);
 
-	tcache = *tcache_tsd_get();
-	if ((uintptr_t)tcache <= (uintptr_t)TCACHE_STATE_MAX) {
-		if (tcache == TCACHE_STATE_DISABLED)
-			return (NULL);
-		tcache = tcache_get_hard(tcache, create);
+	tcache = tsd_tcache_get(tsd);
+	if (!create)
+		return (tcache);
+	if (unlikely(tcache == NULL) && tsd_nominal(tsd)) {
+		tcache = tcache_get_hard(tsd);
+		tsd_tcache_set(tsd, tcache);
 	}
 
 	return (tcache);
@@ -236,7 +209,7 @@ tcache_event(tcache_t *tcache)
 
 	tcache->ev_cnt++;
 	assert(tcache->ev_cnt <= TCACHE_GC_INCR);
-	if (tcache->ev_cnt == TCACHE_GC_INCR)
+	if (unlikely(tcache->ev_cnt == TCACHE_GC_INCR))
 		tcache_event_hard(tcache);
 }
 
@@ -245,12 +218,12 @@ tcache_alloc_easy(tcache_bin_t *tbin)
 {
 	void *ret;
 
-	if (tbin->ncached == 0) {
+	if (unlikely(tbin->ncached == 0)) {
 		tbin->low_water = -1;
 		return (NULL);
 	}
 	tbin->ncached--;
-	if ((int)tbin->ncached < tbin->low_water)
+	if (unlikely((int)tbin->ncached < tbin->low_water))
 		tbin->low_water = tbin->ncached;
 	ret = tbin->avail[tbin->ncached];
 	return (ret);
@@ -268,23 +241,23 @@ tcache_alloc_small(tcache_t *tcache, size_t size, bool zero)
 	tbin = &tcache->tbins[binind];
 	size = small_bin2size(binind);
 	ret = tcache_alloc_easy(tbin);
-	if (ret == NULL) {
+	if (unlikely(ret == NULL)) {
 		ret = tcache_alloc_small_hard(tcache, tbin, binind);
 		if (ret == NULL)
 			return (NULL);
 	}
 	assert(tcache_salloc(ret) == size);
 
-	if (zero == false) {
+	if (likely(!zero)) {
 		if (config_fill) {
-			if (opt_junk) {
+			if (unlikely(opt_junk)) {
 				arena_alloc_junk_small(ret,
 				    &arena_bin_info[binind], false);
-			} else if (opt_zero)
+			} else if (unlikely(opt_zero))
 				memset(ret, 0, size);
 		}
 	} else {
-		if (config_fill && opt_junk) {
+		if (config_fill && unlikely(opt_junk)) {
 			arena_alloc_junk_small(ret, &arena_bin_info[binind],
 			    true);
 		}
@@ -312,7 +285,7 @@ tcache_alloc_large(tcache_t *tcache, size_t size, bool zero)
 	assert(binind < nhbins);
 	tbin = &tcache->tbins[binind];
 	ret = tcache_alloc_easy(tbin);
-	if (ret == NULL) {
+	if (unlikely(ret == NULL)) {
 		/*
 		 * Only allocate one large object at a time, because it's quite
 		 * expensive to create one and not use it.
@@ -329,11 +302,11 @@ tcache_alloc_large(tcache_t *tcache, size_t size, bool zero)
 			arena_mapbits_large_binind_set(chunk, pageind,
 			    BININD_INVALID);
 		}
-		if (zero == false) {
+		if (likely(!zero)) {
 			if (config_fill) {
-				if (opt_junk)
+				if (unlikely(opt_junk))
 					memset(ret, 0xa5, size);
-				else if (opt_zero)
+				else if (unlikely(opt_zero))
 					memset(ret, 0, size);
 			}
 		} else
@@ -357,12 +330,12 @@ tcache_dalloc_small(tcache_t *tcache, void *ptr, size_t binind)
 
 	assert(tcache_salloc(ptr) <= SMALL_MAXCLASS);
 
-	if (config_fill && opt_junk)
+	if (config_fill && unlikely(opt_junk))
 		arena_dalloc_junk_small(ptr, &arena_bin_info[binind]);
 
 	tbin = &tcache->tbins[binind];
 	tbin_info = &tcache_bin_info[binind];
-	if (tbin->ncached == tbin_info->ncached_max) {
+	if (unlikely(tbin->ncached == tbin_info->ncached_max)) {
 		tcache_bin_flush_small(tbin, binind, (tbin_info->ncached_max >>
 		    1), tcache);
 	}
@@ -386,12 +359,12 @@ tcache_dalloc_large(tcache_t *tcache, void *ptr, size_t size)
 
 	binind = NBINS + (size >> LG_PAGE) - 1;
 
-	if (config_fill && opt_junk)
+	if (config_fill && unlikely(opt_junk))
 		memset(ptr, 0x5a, size);
 
 	tbin = &tcache->tbins[binind];
 	tbin_info = &tcache_bin_info[binind];
-	if (tbin->ncached == tbin_info->ncached_max) {
+	if (unlikely(tbin->ncached == tbin_info->ncached_max)) {
 		tcache_bin_flush_large(tbin, binind, (tbin_info->ncached_max >>
 		    1), tcache);
 	}
