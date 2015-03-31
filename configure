@@ -4886,6 +4886,7 @@ case "${host}" in
 	abi="elf"
 	$as_echo "#define JEMALLOC_PURGE_MADVISE_FREE  " >>confdefs.h
 
+  force_tls="0"
 	;;
   *-*-linux*)
 	CFLAGS="$CFLAGS"
