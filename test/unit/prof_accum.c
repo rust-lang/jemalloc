@@ -1,9 +1,9 @@
-#include "prof_accum.h"
+#include "test/jemalloc_test.h"
 
-#ifdef JEMALLOC_PROF
-const char *malloc_conf =
-    "prof:true,prof_accum:true,prof_active:false,lg_prof_sample:0";
-#endif
+#define	NTHREADS		4
+#define	NALLOCS_PER_THREAD	50
+#define	DUMP_INTERVAL		1
+#define	BT_COUNT_CHECK_INTERVAL	5
 
 static int
 prof_dump_open_intercept(bool propagate_err, const char *filename)
@@ -20,7 +20,7 @@ static void *
 alloc_from_permuted_backtrace(unsigned thd_ind, unsigned iteration)
 {
 
-	return (alloc_0(thd_ind*NALLOCS_PER_THREAD + iteration));
+	return (btalloc(1, thd_ind*NALLOCS_PER_THREAD + iteration));
 }
 
 static void *
@@ -63,8 +63,9 @@ TEST_BEGIN(test_idump)
 	test_skip_if(!config_prof);
 
 	active = true;
-	assert_d_eq(mallctl("prof.active", NULL, NULL, &active, sizeof(active)),
-	    0, "Unexpected mallctl failure while activating profiling");
+	assert_d_eq(mallctl("prof.active", NULL, NULL, (void *)&active,
+	    sizeof(active)), 0,
+	    "Unexpected mallctl failure while activating profiling");
 
 	prof_dump_open = prof_dump_open_intercept;
 
